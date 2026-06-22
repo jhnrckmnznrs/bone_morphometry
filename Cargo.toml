@@ -1,0 +1,19 @@
+[package]
+name = "bone-morphometry"
+version = "0.2.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Fast 3-D trabecular bone morphometry for binary TIFF stacks"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+csv = "1.3"
+rayon = "1.11"
+tiff = "0.11.3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

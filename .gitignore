@@ -1,0 +1,5 @@
+/target/
+*.csv
+*.raw
+*.euler
+.DS_Store
