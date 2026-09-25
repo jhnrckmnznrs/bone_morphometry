@@ -8,6 +8,9 @@ const INF: f64 = 1.0e30;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     Foreground,
+    // Retained for the tested generic EDT API; production morphometry currently
+    // materializes marrow explicitly and then uses Foreground.
+    #[allow(dead_code)]
     Background,
 }
 
@@ -45,9 +48,16 @@ impl Scratch {
     }
 }
 
-/// Exact Euclidean distance transform of the selected binary phase.
-/// Selected voxels receive their distance to the nearest voxel in the opposite phase.
-pub fn euclidean_distance_transform(volume: &BinaryVolume, phase: Phase) -> Result<Vec<f32>> {
+/// Exact squared Euclidean distance transform of the selected binary phase.
+///
+/// Selected voxels receive their squared centre-to-centre distance to the
+/// nearest voxel in the opposite phase. No implicit exterior halo is added.
+/// This is the boundary convention used by Fiji's `EDT_S1D`, which underlies
+/// BoneJ's thickness wrapper.
+pub fn euclidean_distance_transform_squared(
+    volume: &BinaryVolume,
+    phase: Phase,
+) -> Result<Vec<u32>> {
     if volume.data.iter().all(|&value| phase.is_selected(value)) {
         bail!(
             "distance transform is undefined for an all-{} volume unless an exterior convention is specified",
@@ -125,7 +135,8 @@ pub fn euclidean_distance_transform(volume: &BinaryVolume, phase: Phase) -> Resu
     drop(data);
 
     // Convert the transposed z-line layout directly to ordinary z/y/x layout.
-    let mut distances = vec![0.0f32; volume.len()];
+    // Squared distances are integers on an isotropic voxel grid.
+    let mut distances = vec![0u32; volume.len()];
     distances
         .par_chunks_mut(slice_len)
         .enumerate()
@@ -134,12 +145,23 @@ pub fn euclidean_distance_transform(volume: &BinaryVolume, phase: Phase) -> Resu
                 let index = z * slice_len + line_id;
 
                 if phase.is_selected(volume.data[index]) {
-                    slice[line_id] = z_lines[line_id * depth + z].sqrt() as f32;
+                    let squared = z_lines[line_id * depth + z];
+                    debug_assert!(squared.is_finite() && squared >= 0.0);
+                    slice[line_id] = squared.round() as u32;
                 }
             }
         });
 
     Ok(distances)
+}
+
+/// Exact Euclidean distance transform of the selected binary phase.
+#[cfg(test)]
+pub fn euclidean_distance_transform(volume: &BinaryVolume, phase: Phase) -> Result<Vec<f32>> {
+    Ok(euclidean_distance_transform_squared(volume, phase)?
+        .into_par_iter()
+        .map(|squared| (squared as f32).sqrt())
+        .collect())
 }
 
 /// Felzenszwalb-Huttenlocher lower-envelope transform in O(n).

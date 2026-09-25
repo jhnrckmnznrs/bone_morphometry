@@ -1,9 +1,14 @@
 [package]
 name = "bone-morphometry"
-version = "0.2.0"
+version = "0.7.0-rc.3"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "Fast 3-D trabecular bone morphometry for binary TIFF stacks"
+repository = "https://github.com/jhnrckmnznrs/bone_morphometry"
+description = "ROI-aware 3-D trabecular bone morphometry with BoneJ-compatible and advanced descriptors"
+
+[features]
+default = []
+validation-hooks = []
 
 [dependencies]
 anyhow = "1.0"

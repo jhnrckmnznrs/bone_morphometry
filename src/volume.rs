@@ -75,6 +75,35 @@ impl BinaryVolume {
         self.width * self.height
     }
 
+    #[inline]
+    pub fn same_shape(&self, other: &Self) -> bool {
+        self.width == other.width && self.height == other.height && self.depth == other.depth
+    }
+
+    /// Select either the bone or marrow phase, but only inside the ROI.
+    pub fn phase_inside(&self, roi: &Self, select_bone: bool) -> Result<Self> {
+        if !self.same_shape(roi) {
+            bail!(
+                "binary image dimensions {}x{}x{} do not match ROI dimensions {}x{}x{}",
+                self.width,
+                self.height,
+                self.depth,
+                roi.width,
+                roi.height,
+                roi.depth
+            );
+        }
+
+        let data = self
+            .data
+            .iter()
+            .zip(&roi.data)
+            .map(|(&bone, &inside)| u8::from(inside != 0 && ((bone != 0) == select_bone)))
+            .collect();
+
+        Self::new(data, self.width, self.height, self.depth)
+    }
+
     #[cfg(test)]
     pub fn complement(&self) -> Self {
         let data = self.data.iter().map(|&v| u8::from(v == 0)).collect();
@@ -84,5 +113,25 @@ impl BinaryVolume {
             height: self.height,
             depth: self.depth,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase_inside_distinguishes_marrow_from_outside_roi() {
+        let bone = BinaryVolume::new(vec![0, 1, 0, 1, 0, 1, 0, 1], 2, 2, 2).unwrap();
+        let roi = BinaryVolume::new(vec![0, 0, 1, 1, 1, 1, 0, 0], 2, 2, 2).unwrap();
+
+        assert_eq!(
+            bone.phase_inside(&roi, true).unwrap().data,
+            vec![0, 0, 0, 1, 0, 1, 0, 0]
+        );
+        assert_eq!(
+            bone.phase_inside(&roi, false).unwrap().data,
+            vec![0, 0, 1, 0, 1, 0, 0, 0]
+        );
     }
 }

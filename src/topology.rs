@@ -4,7 +4,7 @@ use crate::volume::BinaryVolume;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Topology {
-    pub corrected_euler: f64,
+    pub raw_euler: i64,
     pub beta0: usize,
     pub beta1: usize,
     pub beta2: usize,
@@ -13,20 +13,20 @@ pub struct Topology {
 #[derive(Clone, Copy, Debug)]
 pub struct CubicalMeasures {
     pub raw_euler: i64,
-    pub surface_face_count: i64,
     pub mean_breadth_lattice_units: f64,
 }
 
-pub fn analyze_topology(
-    volume: &BinaryVolume,
-    raw_euler: i64,
-    include_boundary_correction: bool,
-) -> Result<Topology> {
-    let corrected_euler = if include_boundary_correction {
-        raw_euler as f64 - bonej_edge_correction(volume)
-    } else {
-        f64::NAN
-    };
+/// BoneJ connectivity quantities computed from its rectangular-stack edge
+/// correction. These are deliberately distinct from the exact ROI-clipped
+/// Betti number stored in [`Topology::beta1`].
+#[derive(Clone, Copy, Debug)]
+pub struct BonejConnectivity {
+    pub edge_correction: f64,
+    pub delta_chi: f64,
+    pub connectivity: f64,
+}
+
+pub fn analyze_topology(volume: &BinaryVolume, raw_euler: i64) -> Result<Topology> {
     let beta0 = count_components(volume, true, Connectivity::TwentySix);
     let beta2 = count_enclosed_background_components_6(volume);
 
@@ -43,7 +43,7 @@ pub fn analyze_topology(
     let beta1 = usize::try_from(beta1_i64).context("beta1 does not fit in usize")?;
 
     Ok(Topology {
-        corrected_euler,
+        raw_euler,
         beta0,
         beta1,
         beta2,
@@ -163,25 +163,22 @@ pub fn cubical_measures(volume: &BinaryVolume) -> CubicalMeasures {
     }
 
     let raw_euler = vertices - edges + faces - cubes;
-    let surface_face_count = 2 * (faces - 3 * cubes);
     let mean_breadth_lattice_units = 0.5 * (edges - 2 * faces + 3 * cubes) as f64;
 
     CubicalMeasures {
         raw_euler,
-        surface_face_count,
         mean_breadth_lattice_units,
     }
 }
 
-#[inline(always)]
-fn any_foreground(volume: &BinaryVolume, coordinates: &[(isize, isize, isize)]) -> bool {
-    coordinates
-        .iter()
-        .any(|&(x, y, z)| volume.get_signed(x, y, z))
-}
-
-/// Exact port of BoneJ's stack-boundary correction.
-pub fn bonej_edge_correction(volume: &BinaryVolume) -> f64 {
+/// Reproduce BoneJ's `Connectivity.getDeltaChi()` and
+/// `Connectivity.getConnectivity()` conventions.
+///
+/// BoneJ corrects the Euler characteristic at the six faces of the enclosing
+/// rectangular image stack. It does not know the curved boundary of a supplied
+/// voxel ROI mask. The ROI-aware batch script uses this same correction on the
+/// ROI-clipped bone image and divides the resulting connectivity by ROI TV.
+pub fn bonej_connectivity(volume: &BinaryVolume, raw_euler: i64) -> BonejConnectivity {
     let f = stack_vertices(volume);
     let e = stack_edges(volume) + 3 * f;
     let c = stack_faces(volume) + 2 * e - 3 * f;
@@ -192,213 +189,310 @@ pub fn bonej_edge_correction(volume: &BinaryVolume) -> f64 {
     let chi_zero = f as f64;
     let chi_one = (d - e) as f64;
     let chi_two = (a - b + c) as f64;
-    chi_two / 2.0 + chi_one / 4.0 + chi_zero / 8.0
+    let edge_correction = chi_two / 2.0 + chi_one / 4.0 + chi_zero / 8.0;
+    let delta_chi = raw_euler as f64 - edge_correction;
+    let connectivity = 1.0 - delta_chi;
+
+    BonejConnectivity {
+        edge_correction,
+        delta_chi,
+        connectivity,
+    }
+}
+
+fn stack_vertices(volume: &BinaryVolume) -> i64 {
+    let mut count = 0i64;
+    for z in [0, volume.depth - 1] {
+        for y in [0, volume.height - 1] {
+            for x in [0, volume.width - 1] {
+                count += bool_i64(volume.get(x, y, z) != 0);
+            }
+        }
+    }
+    count
+}
+
+fn stack_edges(volume: &BinaryVolume) -> i64 {
+    let mut count = 0i64;
+
+    for z in [0, volume.depth - 1] {
+        for y in [0, volume.height - 1] {
+            for x in 1..volume.width - 1 {
+                count += bool_i64(volume.get(x, y, z) != 0);
+            }
+        }
+    }
+
+    for z in [0, volume.depth - 1] {
+        for x in [0, volume.width - 1] {
+            for y in 1..volume.height - 1 {
+                count += bool_i64(volume.get(x, y, z) != 0);
+            }
+        }
+    }
+
+    for y in [0, volume.height - 1] {
+        for x in [0, volume.width - 1] {
+            for z in 1..volume.depth - 1 {
+                count += bool_i64(volume.get(x, y, z) != 0);
+            }
+        }
+    }
+
+    count
+}
+
+fn stack_faces(volume: &BinaryVolume) -> i64 {
+    let mut count = 0i64;
+
+    for z in [0, volume.depth - 1] {
+        for y in 1..volume.height - 1 {
+            for x in 1..volume.width - 1 {
+                count += bool_i64(volume.get(x, y, z) != 0);
+            }
+        }
+    }
+
+    for y in [0, volume.height - 1] {
+        for z in 1..volume.depth - 1 {
+            for x in 1..volume.width - 1 {
+                count += bool_i64(volume.get(x, y, z) != 0);
+            }
+        }
+    }
+
+    for x in [0, volume.width - 1] {
+        for y in 1..volume.height - 1 {
+            for z in 1..volume.depth - 1 {
+                count += bool_i64(volume.get(x, y, z) != 0);
+            }
+        }
+    }
+
+    count
+}
+
+fn face_vertices(volume: &BinaryVolume) -> i64 {
+    let mut count = 0i64;
+
+    for z in [0, volume.depth - 1] {
+        for y in 0..=volume.height {
+            for x in 0..=volume.width {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize, y as isize - 1, z as isize)
+                        || foreground_at(volume, x as isize - 1, y as isize - 1, z as isize)
+                        || foreground_at(volume, x as isize - 1, y as isize, z as isize),
+                );
+            }
+        }
+    }
+
+    for x in [0, volume.width - 1] {
+        for y in 0..=volume.height {
+            for z in 1..volume.depth {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize, y as isize - 1, z as isize)
+                        || foreground_at(volume, x as isize, y as isize - 1, z as isize - 1)
+                        || foreground_at(volume, x as isize, y as isize, z as isize - 1),
+                );
+            }
+        }
+    }
+
+    for y in [0, volume.height - 1] {
+        for x in 1..volume.width {
+            for z in 1..volume.depth {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize, y as isize, z as isize - 1)
+                        || foreground_at(volume, x as isize - 1, y as isize, z as isize - 1)
+                        || foreground_at(volume, x as isize - 1, y as isize, z as isize),
+                );
+            }
+        }
+    }
+
+    count
+}
+
+fn face_edges(volume: &BinaryVolume) -> i64 {
+    let mut count = 0i64;
+
+    for z in [0, volume.depth - 1] {
+        for y in 0..=volume.height {
+            for x in 0..=volume.width {
+                if foreground_at(volume, x as isize, y as isize, z as isize) {
+                    count += 2;
+                } else {
+                    count += bool_i64(foreground_at(
+                        volume,
+                        x as isize,
+                        y as isize - 1,
+                        z as isize,
+                    ));
+                    count += bool_i64(foreground_at(
+                        volume,
+                        x as isize - 1,
+                        y as isize,
+                        z as isize,
+                    ));
+                }
+            }
+        }
+    }
+
+    for y in [0, volume.height - 1] {
+        for z in 1..volume.depth {
+            for x in 0..volume.width {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize, y as isize, z as isize - 1),
+                );
+            }
+        }
+
+        for z in 0..volume.depth {
+            for x in 0..=volume.width {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize - 1, y as isize, z as isize),
+                );
+            }
+        }
+    }
+
+    for x in [0, volume.width - 1] {
+        for z in 1..volume.depth {
+            for y in 0..volume.height {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize, y as isize, z as isize - 1),
+                );
+            }
+        }
+
+        for z in 0..volume.depth {
+            for y in 1..volume.height {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize, y as isize - 1, z as isize),
+                );
+            }
+        }
+    }
+
+    count
+}
+
+fn edge_vertices(volume: &BinaryVolume) -> i64 {
+    let mut count = 0i64;
+
+    for z in [0, volume.depth - 1] {
+        for y in [0, volume.height - 1] {
+            for x in 1..volume.width {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize - 1, y as isize, z as isize),
+                );
+            }
+        }
+    }
+
+    for z in [0, volume.depth - 1] {
+        for x in [0, volume.width - 1] {
+            for y in 1..volume.height {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize, y as isize - 1, z as isize),
+                );
+            }
+        }
+    }
+
+    for x in [0, volume.width - 1] {
+        for y in [0, volume.height - 1] {
+            for z in 1..volume.depth {
+                count += bool_i64(
+                    foreground_at(volume, x as isize, y as isize, z as isize)
+                        || foreground_at(volume, x as isize, y as isize, z as isize - 1),
+                );
+            }
+        }
+    }
+
+    count
 }
 
 #[inline]
-fn end_indices(length: usize) -> [usize; 2] {
-    [0, length - 1]
+fn foreground_at(volume: &BinaryVolume, x: isize, y: isize, z: isize) -> bool {
+    volume.get_signed(x, y, z)
 }
 
-fn stack_vertices(v: &BinaryVolume) -> i64 {
-    let mut count = 0;
-    for z in end_indices(v.depth) {
-        for y in end_indices(v.height) {
-            for x in end_indices(v.width) {
-                count += i64::from(v.get(x, y, z) != 0);
-            }
-        }
+#[inline(always)]
+fn bool_i64(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
     }
-    count
 }
 
-fn stack_edges(v: &BinaryVolume) -> i64 {
-    let mut count = 0;
-    for z in end_indices(v.depth) {
-        for y in end_indices(v.height) {
-            for x in 1..v.width - 1 {
-                count += i64::from(v.get(x, y, z) != 0);
+/// Count only bone-marrow faces whose two incident voxels are inside the ROI.
+///
+/// Faces where bone touches the cylindrical ROI boundary are observation-window
+/// cuts, not biological bone surface, and are therefore excluded.
+pub fn bone_marrow_interface_faces(bone: &BinaryVolume, roi: &BinaryVolume) -> Result<i64> {
+    ensure!(
+        bone.same_shape(roi),
+        "bone dimensions {}x{}x{} do not match ROI dimensions {}x{}x{}",
+        bone.width,
+        bone.height,
+        bone.depth,
+        roi.width,
+        roi.height,
+        roi.depth
+    );
+
+    let mut faces = 0i64;
+    for z in 0..bone.depth {
+        for y in 0..bone.height {
+            for x in 0..bone.width {
+                if roi.get(x, y, z) == 0 {
+                    continue;
+                }
+                let center_is_bone = bone.get(x, y, z) != 0;
+
+                if x + 1 < bone.width
+                    && roi.get(x + 1, y, z) != 0
+                    && center_is_bone != (bone.get(x + 1, y, z) != 0)
+                {
+                    faces += 1;
+                }
+                if y + 1 < bone.height
+                    && roi.get(x, y + 1, z) != 0
+                    && center_is_bone != (bone.get(x, y + 1, z) != 0)
+                {
+                    faces += 1;
+                }
+                if z + 1 < bone.depth
+                    && roi.get(x, y, z + 1) != 0
+                    && center_is_bone != (bone.get(x, y, z + 1) != 0)
+                {
+                    faces += 1;
+                }
             }
         }
     }
-    for z in end_indices(v.depth) {
-        for x in end_indices(v.width) {
-            for y in 1..v.height - 1 {
-                count += i64::from(v.get(x, y, z) != 0);
-            }
-        }
-    }
-    for y in end_indices(v.height) {
-        for x in end_indices(v.width) {
-            for z in 1..v.depth - 1 {
-                count += i64::from(v.get(x, y, z) != 0);
-            }
-        }
-    }
-    count
+    Ok(faces)
 }
 
-fn stack_faces(v: &BinaryVolume) -> i64 {
-    let mut count = 0;
-    for z in end_indices(v.depth) {
-        for y in 1..v.height - 1 {
-            for x in 1..v.width - 1 {
-                count += i64::from(v.get(x, y, z) != 0);
-            }
-        }
-    }
-    for y in end_indices(v.height) {
-        for z in 1..v.depth - 1 {
-            for x in 1..v.width - 1 {
-                count += i64::from(v.get(x, y, z) != 0);
-            }
-        }
-    }
-    for x in end_indices(v.width) {
-        for y in 1..v.height - 1 {
-            for z in 1..v.depth - 1 {
-                count += i64::from(v.get(x, y, z) != 0);
-            }
-        }
-    }
-    count
-}
-
-fn face_vertices(v: &BinaryVolume) -> i64 {
-    let mut count = 0;
-    for z in end_indices(v.depth) {
-        for y in 0..=v.height {
-            for x in 0..=v.width {
-                if v.get_signed(x as isize, y as isize, z as isize)
-                    || v.get_signed(x as isize, y as isize - 1, z as isize)
-                    || v.get_signed(x as isize - 1, y as isize - 1, z as isize)
-                    || v.get_signed(x as isize - 1, y as isize, z as isize)
-                {
-                    count += 1;
-                }
-            }
-        }
-    }
-    for x in end_indices(v.width) {
-        for y in 0..=v.height {
-            for z in 1..v.depth {
-                if v.get_signed(x as isize, y as isize, z as isize)
-                    || v.get_signed(x as isize, y as isize - 1, z as isize)
-                    || v.get_signed(x as isize, y as isize - 1, z as isize - 1)
-                    || v.get_signed(x as isize, y as isize, z as isize - 1)
-                {
-                    count += 1;
-                }
-            }
-        }
-    }
-    for y in end_indices(v.height) {
-        for x in 1..v.width {
-            for z in 1..v.depth {
-                if v.get_signed(x as isize, y as isize, z as isize)
-                    || v.get_signed(x as isize, y as isize, z as isize - 1)
-                    || v.get_signed(x as isize - 1, y as isize, z as isize - 1)
-                    || v.get_signed(x as isize - 1, y as isize, z as isize)
-                {
-                    count += 1;
-                }
-            }
-        }
-    }
-    count
-}
-
-fn face_edges(v: &BinaryVolume) -> i64 {
-    let mut count = 0;
-    for z in end_indices(v.depth) {
-        for y in 0..=v.height {
-            for x in 0..=v.width {
-                if v.get_signed(x as isize, y as isize, z as isize) {
-                    count += 2;
-                } else {
-                    count += i64::from(v.get_signed(x as isize, y as isize - 1, z as isize));
-                    count += i64::from(v.get_signed(x as isize - 1, y as isize, z as isize));
-                }
-            }
-        }
-    }
-    for y in end_indices(v.height) {
-        for z in 1..v.depth {
-            for x in 0..v.width {
-                if v.get_signed(x as isize, y as isize, z as isize)
-                    || v.get_signed(x as isize, y as isize, z as isize - 1)
-                {
-                    count += 1;
-                }
-            }
-        }
-    }
-    for y in end_indices(v.height) {
-        for z in 0..v.depth {
-            for x in 0..=v.width {
-                if v.get_signed(x as isize, y as isize, z as isize)
-                    || v.get_signed(x as isize - 1, y as isize, z as isize)
-                {
-                    count += 1;
-                }
-            }
-        }
-    }
-    for x in end_indices(v.width) {
-        for z in 1..v.depth {
-            for y in 0..v.height {
-                if v.get_signed(x as isize, y as isize, z as isize)
-                    || v.get_signed(x as isize, y as isize, z as isize - 1)
-                {
-                    count += 1;
-                }
-            }
-        }
-    }
-    for x in end_indices(v.width) {
-        for z in 0..v.depth {
-            for y in 1..v.height {
-                if v.get_signed(x as isize, y as isize, z as isize)
-                    || v.get_signed(x as isize, y as isize - 1, z as isize)
-                {
-                    count += 1;
-                }
-            }
-        }
-    }
-    count
-}
-
-fn edge_vertices(v: &BinaryVolume) -> i64 {
-    let mut count = 0;
-    for z in end_indices(v.depth) {
-        for y in end_indices(v.height) {
-            for x in 1..v.width {
-                if v.get(x, y, z) != 0 || v.get(x - 1, y, z) != 0 {
-                    count += 1;
-                }
-            }
-        }
-    }
-    for z in end_indices(v.depth) {
-        for x in end_indices(v.width) {
-            for y in 1..v.height {
-                if v.get(x, y, z) != 0 || v.get(x, y - 1, z) != 0 {
-                    count += 1;
-                }
-            }
-        }
-    }
-    for x in end_indices(v.width) {
-        for y in end_indices(v.height) {
-            for z in 1..v.depth {
-                if v.get(x, y, z) != 0 || v.get(x, y, z - 1) != 0 {
-                    count += 1;
-                }
-            }
-        }
-    }
-    count
+#[inline(always)]
+fn any_foreground(volume: &BinaryVolume, coordinates: &[(isize, isize, isize)]) -> bool {
+    coordinates
+        .iter()
+        .any(|&(x, y, z)| volume.get_signed(x, y, z))
 }
 
 #[derive(Clone, Copy)]
@@ -614,26 +708,82 @@ mod tests {
     #[test]
     fn single_voxel_cubical_measures() {
         let v = volume_with_points(&[(2, 2, 2)]);
+        let roi = BinaryVolume::new(vec![1u8; 125], 5, 5, 5).unwrap();
         let measures = cubical_measures(&v);
         assert_eq!(measures.raw_euler, 1);
-        assert_eq!(measures.surface_face_count, 6);
+        assert_eq!(bone_marrow_interface_faces(&v, &roi).unwrap(), 6);
         assert!((measures.mean_breadth_lattice_units - 1.5).abs() < 1e-12);
     }
 
     #[test]
     fn two_face_connected_voxels_form_a_two_by_one_by_one_box() {
         let v = volume_with_points(&[(1, 1, 1), (2, 1, 1)]);
+        let roi = BinaryVolume::new(vec![1u8; 125], 5, 5, 5).unwrap();
         let measures = cubical_measures(&v);
         assert_eq!(measures.raw_euler, 1);
-        assert_eq!(measures.surface_face_count, 10);
+        assert_eq!(bone_marrow_interface_faces(&v, &roi).unwrap(), 10);
         assert!((measures.mean_breadth_lattice_units - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bonej_connectivity_is_five_for_an_interior_box_frame() {
+        let size = 9usize;
+        let mut data = vec![0u8; size * size * size];
+        for z in 2..=6 {
+            for y in 2..=6 {
+                for x in 2..=6 {
+                    let boundary_coordinates = (x == 2 || x == 6) as usize
+                        + (y == 2 || y == 6) as usize
+                        + (z == 2 || z == 6) as usize;
+                    if boundary_coordinates >= 2 {
+                        data[(z * size + y) * size + x] = 1;
+                    }
+                }
+            }
+        }
+        let volume = BinaryVolume::new(data, size, size, size).unwrap();
+        let raw_euler = cubical_measures(&volume).raw_euler;
+        let result = bonej_connectivity(&volume, raw_euler);
+
+        assert_eq!(raw_euler, -4);
+        assert_eq!(result.edge_correction, 0.0);
+        assert_eq!(result.delta_chi, -4.0);
+        assert_eq!(result.connectivity, 5.0);
+    }
+
+    #[test]
+    fn bonej_corner_voxel_uses_fractional_stack_edge_correction() {
+        let volume = volume_with_points(&[(0, 0, 0)]);
+        let raw_euler = cubical_measures(&volume).raw_euler;
+        let result = bonej_connectivity(&volume, raw_euler);
+
+        assert_eq!(raw_euler, 1);
+        assert_eq!(result.edge_correction, 0.875);
+        assert_eq!(result.delta_chi, 0.125);
+        assert_eq!(result.connectivity, 0.875);
+    }
+
+    #[test]
+    fn interface_surface_excludes_the_roi_cut_face() {
+        let bone = volume_with_points(&[(1, 2, 2)]);
+        let mut roi_data = vec![0u8; 125];
+        for z in 1..=3 {
+            for y in 1..=3 {
+                for x in 1..=3 {
+                    roi_data[(z * 5 + y) * 5 + x] = 1;
+                }
+            }
+        }
+        let roi = BinaryVolume::new(roi_data, 5, 5, 5).unwrap();
+
+        assert_eq!(bone_marrow_interface_faces(&bone, &roi).unwrap(), 5);
     }
 
     #[test]
     fn corner_touching_voxels_are_one_26_component() {
         let v = volume_with_points(&[(1, 1, 1), (2, 2, 2)]);
         let measures = cubical_measures(&v);
-        let topology = analyze_topology(&v, measures.raw_euler, false).unwrap();
+        let topology = analyze_topology(&v, measures.raw_euler).unwrap();
         assert_eq!(measures.raw_euler, 1);
         assert_eq!(topology.beta0, 1);
         assert_eq!(topology.beta1, 0);
@@ -644,7 +794,7 @@ mod tests {
     fn separated_voxels_have_two_components() {
         let v = volume_with_points(&[(1, 1, 1), (3, 3, 3)]);
         let measures = cubical_measures(&v);
-        let topology = analyze_topology(&v, measures.raw_euler, false).unwrap();
+        let topology = analyze_topology(&v, measures.raw_euler).unwrap();
         assert_eq!(measures.raw_euler, 2);
         assert_eq!(topology.beta0, 2);
         assert_eq!(topology.beta1, 0);
@@ -665,7 +815,7 @@ mod tests {
         }
         let v = BinaryVolume::new(data, 5, 5, 5).unwrap();
         let measures = cubical_measures(&v);
-        let topology = analyze_topology(&v, measures.raw_euler, false).unwrap();
+        let topology = analyze_topology(&v, measures.raw_euler).unwrap();
         assert_eq!(measures.raw_euler, 2);
         assert_eq!(topology.beta0, 1);
         assert_eq!(topology.beta1, 0);
